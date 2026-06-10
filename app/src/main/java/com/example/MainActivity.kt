@@ -27,11 +27,23 @@ class MainActivity : ComponentActivity() {
         val factory = GameViewModelFactory(application, repository)
         val viewModel = ViewModelProvider(this, factory)[GameViewModel::class.java]
 
+        setContent { package com.example.gta6troll // Thay bằng package chuẩn của bạn
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import com.example.ui.game.GtaTrollScreen // Import file số 1 vào đây
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
         setContent {
-            MyApplicationTheme {
-                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    // Fullscreen Canvas is edge-to-edge; padding is managed inside HUD overlays
-                    EscapeMomGameApp(viewModel = viewModel)
+            // Gọi hàm này để kích hoạt chuỗi màn hình troll theo đúng thứ tự
+            GtaTrollScreen() 
+        }
+    }
+}
+
                 }
             }
         }
