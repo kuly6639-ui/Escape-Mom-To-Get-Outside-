@@ -1,0 +1,6 @@
+{
+  "name": "Escape Mom To Get Outside",
+  "description": "A thrilling 3D pseudo-perspective stealth game. Sneak past Mom, search rooms for keys, and unlock doors to escape outdoors!",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
