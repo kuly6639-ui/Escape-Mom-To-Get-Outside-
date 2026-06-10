@@ -639,288 +639,900 @@ fun GamePlayScreen(viewModel: GameViewModel) {
 
     val activeLevelData = level!!
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        // Pseudo-3D Game Engine Viewport
+    var isDraggingRightHalf by remember { mutableStateOf(false) }
+
+    val isChasing by viewModel.isChasing.collectAsStateWithLifecycle()
+    val keyFoundMessage by viewModel.keyFoundMessage.collectAsStateWithLifecycle()
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .pointerInput(Unit) {
+                detectDragGestures(
+                    onDragStart = { offset ->
+                        if (offset.x > size.width / 2f) {
+                            isDraggingRightHalf = true
+                        }
+                    },
+                    onDragEnd = {
+                        isDraggingRightHalf = false
+                    },
+                    onDragCancel = {
+                        isDraggingRightHalf = false
+                    },
+                    onDrag = { change, dragAmount ->
+                        if (isDraggingRightHalf) {
+                            change.consume()
+                            viewModel.onCameraRotateDrag(dragAmount.x, dragAmount.y)
+                        }
+                    }
+                )
+            }
+    ) {
+        // True First Person 3D viewport canvas
         Canvas(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(Unit) {
-                    // Touch inputs handled separately by digital joystick overlay, but canvas registers click
-                }
                 .testTag("game_arena_canvas")
         ) {
             canvasSize = size
 
             val width = size.width
             val height = size.height
-
-            // Calculate Dynamic grid tiles size based on device orientation (prefer vertical flow)
-            // Scroll coordinate camera centered over Player location
-            val tileSize = with(density) { 68.dp.toPx() }
+            val halfW = width / 2f
+            val halfH = height / 2.1f // center of view matches standard horizon line
 
             val px = player.gridPos.x
             val py = player.gridPos.y
+            
+            // Eye Height (pz): standing is 0.45, crouched is 0.23, with realistic walking bobbing
+            val baseEyeH = if (player.isCrouched) 0.22f else 0.45f
+            // Bobbing only when moving
+            val isMoving = viewModel.joystickX != 0f || viewModel.joystickY != 0f
+            val bobVal = if (isMoving && !player.isHiding) {
+                abs(sin(elapsed * 9f)) * 0.04f
+            } else 0f
+            val pz = baseEyeH + bobVal
 
-            val centerCol = width / 2f
-            val centerRow = height / 2.3f // tilt slightly up for room bottom joystick padding
+            val facingAngle = player.headingAngle
+            val pitchRad = (cameraTilt * PI / 180f).toFloat()
+            val fovRad = (82f * PI / 180f).toFloat() // Comfortable immersive FOV
+            val fovScale = 1.0f / tan(fovRad / 2.0f)
 
-            val halfW = centerCol
-            val halfH = centerRow
+            // Local Point3D data helper
+            class LocalPoint3D(val x: Float, val y: Float, val z: Float)
 
-            val rotRad = cameraRotation * PI.toFloat() / 180f
-            val tiltRad = cameraTilt * PI.toFloat() / 180f
+            fun projectToCameraSpace(gx: Float, gy: Float, gz: Float): LocalPoint3D {
+                val dx = gx - px
+                val dy = gy - py
+                val dz = gz - pz
 
-            // Clean background color
-            drawRect(color = Color(0xFF10121C))
+                val depth = dx * cos(facingAngle) + dy * sin(facingAngle)
+                val lateral = dx * (-sin(facingAngle)) + dy * cos(facingAngle)
+                val heightOffset = dz
 
-            // Draw clean background grid tile floors
-            for (gy in 0 until activeLevelData.heightCount) {
-                for (gx in 0 until activeLevelData.widthCount) {
-                    val tileType = activeLevelData.grid[gy][gx]
+                val cosPitch = cos(pitchRad)
+                val sinPitch = sin(pitchRad)
 
-                    // Floor tile center projection
-                    val baseProj = project(gx.toFloat(), gy.toFloat(), 0f, px, py, tileSize, rotRad, tiltRad, halfW, halfH)
-                    val p1 = project(gx + 1.0f, gy.toFloat(), 0f, px, py, tileSize, rotRad, tiltRad, halfW, halfH)
-                    val p2 = project(gx + 1.0f, gy + 1.0f, 0f, px, py, tileSize, rotRad, tiltRad, halfW, halfH)
-                    val p3 = project(gx.toFloat(), gy + 1.0f, 0f, px, py, tileSize, rotRad, tiltRad, halfW, halfH)
+                val camDepth = depth * cosPitch + heightOffset * sinPitch
+                val camHeight = -depth * sinPitch + heightOffset * cosPitch
+                val camLateral = lateral
 
-                    val isWhite = (gx + gy) % 2 == 0
-                    val tileColor = when (activeLevelData.levelId) {
-                        1 -> if (isWhite) Color(0xFF8D6E63) else Color(0xFF5D4037) // Cozy Wooden Kitchen tiles
-                        2 -> if (isWhite) Color(0xFF1F355A) else Color(0xFF142442) // Deep Living Room carpets
-                        else -> if (isWhite) Color(0xFF263238) else Color(0xFF212121) // Elegant dark marble mansion
+                return LocalPoint3D(camLateral, camDepth, camHeight)
+            }
+
+            fun clipFaceAndProject(v: List<LocalPoint3D>): List<Offset> {
+                val nearPlane = 0.06f
+                val output = mutableListOf<LocalPoint3D>()
+                for (i in v.indices) {
+                    val p1 = v[i]
+                    val p2 = v[(i + 1) % v.size]
+
+                    if (p1.y >= nearPlane) {
+                        output.add(p1)
                     }
 
-                    // Draw floor polygon tile
-                    val tilePath = Path().apply {
-                        moveTo(baseProj.x, baseProj.y)
-                        lineTo(p1.x, p1.y)
-                        lineTo(p2.x, p2.y)
-                        lineTo(p3.x, p3.y)
-                        close()
+                    if ((p1.y >= nearPlane && p2.y < nearPlane) || (p1.y < nearPlane && p2.y >= nearPlane)) {
+                        val t = (nearPlane - p1.y) / (p2.y - p1.y)
+                        val ix = p1.x + (p2.x - p1.x) * t
+                        val iy = nearPlane
+                        val iz = p1.z + (p2.z - p1.z) * t
+                        output.add(LocalPoint3D(ix, iy, iz))
                     }
-                    drawPath(tilePath, brush = SolidColor(tileColor))
+                }
 
-                    // Draw grid line dividers on floor
-                    drawPath(tilePath, brush = SolidColor(Color.Black.copy(alpha = 0.12f)), style = Stroke(1.5f))
+                return output.map { pt ->
+                    val sx = halfW + (pt.x / pt.y) * halfW * fovScale
+                    val sy = halfH - (pt.z / pt.y) * halfH * fovScale
+                    Offset(sx, sy)
+                }
+            }
 
-                    // Draw exit door marker on the floor
-                    if (tileType == 3) {
-                        drawPath(tilePath, brush = SolidColor(Color(0xFF4CAF50).copy(alpha = 0.4f)))
-                        drawPath(tilePath, brush = SolidColor(Color(0xFF81C784)), style = Stroke(with(density) { 3.dp.toPx() }))
+            // 1. CLEAR & CEILING DRAW (Deep twilight / room night ceiling)
+            val ceilingBrush = Brush.verticalGradient(
+                colors = listOf(Color(0xFF04060E), Color(0xFF111425))
+            )
+            drawRect(brush = ceilingBrush)
+
+            // Dynamic Horizon Line
+            val horizonY = halfH + tan(pitchRad) * halfH * fovScale
+
+            // 2. FLOOR DRAW (Cozy wood / plush tile floors depending on Level ID)
+            val floorColor = when (activeLevelData.levelId) {
+                1 -> Color(0xFF3E2723) // Rich Dark Kitchen Mahogany
+                2 -> Color(0xFF0D1B2A) // Cozy Living Room Indigo Carpet
+                else -> Color(0xFF1B1B1B) // Slate Black Marble Mansion
+            }
+            drawRect(
+                color = floorColor,
+                topLeft = Offset(0f, horizonY.coerceIn(0f, height)),
+                size = Size(width, (height - horizonY).coerceAtLeast(0f))
+            )
+
+            // Draw grid perspective guidelines on floor and ceiling for deep spatial reference
+            val gridLineColor = Color.White.copy(alpha = 0.06f)
+            val gridLineStroke = 1.5f
+
+            // floor horizontal & vertical guidelines
+            for (gx in 0..activeLevelData.widthCount) {
+                val linePoints = mutableListOf<LocalPoint3D>()
+                for (gy in 0..activeLevelData.heightCount) {
+                    linePoints.add(projectToCameraSpace(gx.toFloat(), gy.toFloat(), 0f))
+                }
+                val scrPoints = clipFaceAndProject(linePoints)
+                if (scrPoints.size >= 2) {
+                    for (k in 0 until scrPoints.size - 1) {
+                        drawLine(gridLineColor, scrPoints[k], scrPoints[k + 1], gridLineStroke)
+                    }
+                }
+            }
+            for (gy in 0..activeLevelData.heightCount) {
+                val linePoints = mutableListOf<LocalPoint3D>()
+                for (gx in 0..activeLevelData.widthCount) {
+                    linePoints.add(projectToCameraSpace(gx.toFloat(), gy.toFloat(), 0f))
+                }
+                val scrPoints = clipFaceAndProject(linePoints)
+                if (scrPoints.size >= 2) {
+                    for (k in 0 until scrPoints.size - 1) {
+                        drawLine(gridLineColor, scrPoints[k], scrPoints[k + 1], gridLineStroke)
                     }
                 }
             }
 
-            // 3D DEPTH RENDERING LIST (Painter's algorithm across all 3D standing blocks)
-            val renderables = mutableListOf<Renderable>()
+            // ceiling gridlines (slightly higher, z=1.8f)
+            val ceilGridColor = Color(0xFFDE3226).copy(alpha = 0.04f)
+            for (gx in 0..activeLevelData.widthCount) {
+                val linePoints = mutableListOf<LocalPoint3D>()
+                for (gy in 0..activeLevelData.heightCount) {
+                    linePoints.add(projectToCameraSpace(gx.toFloat(), gy.toFloat(), 1.8f))
+                }
+                val scrPoints = clipFaceAndProject(linePoints)
+                if (scrPoints.size >= 2) {
+                    for (k in 0 until scrPoints.size - 1) {
+                        drawLine(ceilGridColor, scrPoints[k], scrPoints[k + 1], gridLineStroke)
+                    }
+                }
+            }
 
-            // 1. Add all walls
+            // 3D DEPTH RENDERING LIST (Painter's Algorithm across all standing solids)
+            class RenderObject3D(val type: Int, val gx: Float, val gy: Float, val data: Any?, val depth: Float)
+
+            val renderables = mutableListOf<RenderObject3D>()
+
+            // 1. Gather all Walls
             for (gy in 0 until activeLevelData.heightCount) {
                 for (gx in 0 until activeLevelData.widthCount) {
                     if (activeLevelData.grid[gy][gx] == 1) {
-                        val d = getDepth(gx + 0.5f, gy + 0.5f, px, py, rotRad)
-                        renderables.add(Renderable.Wall(gx, gy, d))
+                        val cam = projectToCameraSpace(gx + 0.5f, gy + 0.5f, 0.7f)
+                        if (cam.y > -0.5f) {
+                            renderables.add(RenderObject3D(1, gx.toFloat(), gy.toFloat(), null, cam.y))
+                        }
                     }
                 }
             }
 
-            // 2. Add all decors
+            // 2. Gather all Decors
             activeLevelData.decors.forEach { decor ->
-                val cx = decor.x + decor.width / 2f
-                val cy = decor.y + decor.height / 2f
-                val d = getDepth(cx, cy, px, py, rotRad)
-                renderables.add(Renderable.Decor(decor, d))
+                val cam = projectToCameraSpace(decor.x + decor.width / 2f, decor.y + decor.height / 2f, 0.4f)
+                if (cam.y > -0.5f) {
+                    renderables.add(RenderObject3D(2, 0f, 0f, decor, cam.y))
+                }
             }
 
-            // 3. Add all key spots
+            // 3. Gather all Cabinet key spots
             spots.forEach { spot ->
-                val d = getDepth(spot.gridX + 0.5f, spot.gridY + 0.5f, px, py, rotRad)
-                renderables.add(Renderable.Spot(spot, d))
+                val cam = projectToCameraSpace(spot.gridX + 0.5f, spot.gridY + 0.5f, 0.3f)
+                if (cam.y > -0.5f) {
+                    renderables.add(RenderObject3D(3, 0f, 0f, spot, cam.y))
+                }
             }
 
-            // 4. Add Player
-            val pDepth = getDepth(px, py, px, py, rotRad) // depth is exactly 0f
-            renderables.add(Renderable.Player(player, pDepth))
-
-            // 5. Add Moms
+            // 4. Gather Moms
             moms.forEach { mom ->
-                val d = getDepth(mom.gridPos.x, mom.gridPos.y, px, py, rotRad)
-                renderables.add(Renderable.Mom(mom, d))
+                val cam = projectToCameraSpace(mom.gridPos.x, mom.gridPos.y, 0.5f)
+                if (cam.y > -0.5f) {
+                    renderables.add(RenderObject3D(4, 0f, 0f, mom, cam.y))
+                }
             }
 
-            // Sort back to front (largest depth distance first, smallest last)
+            // 5. Gather Exit Door gateway location
+            val exitCam = projectToCameraSpace(activeLevelData.exitDoorPos.x, activeLevelData.exitDoorPos.y, 0.6f)
+            if (exitCam.y > -0.5f) {
+                renderables.add(RenderObject3D(5, 0f, 0f, activeLevelData.exitDoorPos, exitCam.y))
+            }
+
+            // Sort ALL solids back-to-front (furthest depth distance first, closest last)
             renderables.sortByDescending { it.depth }
 
-            // Draw all standing renderables in depth sorted order
+            // Draw all solid solids in depth sorted order
             renderables.forEach { renderable ->
-                when (renderable) {
-                    is Renderable.Wall -> {
+                when (renderable.type) {
+                    1 -> {
                         val gx = renderable.gx
                         val gy = renderable.gy
 
-                        val topColor = when (activeLevelData.levelId) {
-                            1 -> Color(0xFFD7CCC8)
-                            2 -> Color(0xFFB0BEC5)
-                            else -> Color(0xFFCFD8DC)
+                        // Color schemes based on level ID
+                        val wallColor = when (activeLevelData.levelId) {
+                            1 -> Color(0xFF6D4C41) // Kitchen brick brown
+                            2 -> Color(0xFF37474F) // Lounge steel blue
+                            else -> Color(0xFF263238) // Gothic marble
                         }
-                        val sideColor = when (activeLevelData.levelId) {
-                            1 -> Color(0xFF8D6E63)
-                            2 -> Color(0xFF546E7A)
-                            else -> Color(0xFF455A64)
-                        }
-                        val frontColor = when (activeLevelData.levelId) {
-                            1 -> Color(0xFFA1887F)
-                            2 -> Color(0xFF78909C)
-                            else -> Color(0xFF546E7A)
-                        }
+                        val wallSideColor = wallColor.copy(red = (wallColor.red * 0.75f).coerceIn(0f, 1f), green = (wallColor.green * 0.75f).coerceIn(0f, 1f), blue = (wallColor.blue * 0.75f).coerceIn(0f, 1f))
+                        val wallTopColor = wallColor.copy(red = (wallColor.red * 1.15f).coerceIn(0f, 1f), green = (wallColor.green * 1.15f).coerceIn(0f, 1f), blue = (wallColor.blue * 1.15f).coerceIn(0f, 1f))
 
-                        drawPerspective3DBox(
-                            gx = gx.toFloat(),
-                            gy = gy.toFloat(),
-                            w = 1.0f - 0.02f,
-                            h = 1.0f - 0.02f,
-                            zHeight = 1.15f,
-                            px = px,
-                            py = py,
-                            tileSize = tileSize,
-                            rotationRad = rotRad,
-                            tiltRad = tiltRad,
-                            halfW = halfW,
-                            halfH = halfH,
-                            topColor = topColor,
-                            sideColor = sideColor,
-                            frontColor = frontColor
+                        val w = 0.98f
+                        val h = 0.98f
+                        val wallH = 1.7f
+
+                        // Construct side faces of the wall cube
+                        val verticesTop = listOf(
+                            projectToCameraSpace(gx, gy, wallH),
+                            projectToCameraSpace(gx + w, gy, wallH),
+                            projectToCameraSpace(gx + w, gy + h, wallH),
+                            projectToCameraSpace(gx, gy + h, wallH)
                         )
+                        val verticesNorth = listOf(
+                            projectToCameraSpace(gx, gy, 0f),
+                            projectToCameraSpace(gx + w, gy, 0f),
+                            projectToCameraSpace(gx + w, gy, wallH),
+                            projectToCameraSpace(gx, gy, wallH)
+                        )
+                        val verticesSouth = listOf(
+                            projectToCameraSpace(gx, gy + h, 0f),
+                            projectToCameraSpace(gx + w, gy + h, 0f),
+                            projectToCameraSpace(gx + w, gy + h, wallH),
+                            projectToCameraSpace(gx, gy + h, wallH)
+                        )
+                        val verticesWest = listOf(
+                            projectToCameraSpace(gx, gy, 0f),
+                            projectToCameraSpace(gx, gy + h, 0f),
+                            projectToCameraSpace(gx, gy + h, wallH),
+                            projectToCameraSpace(gx, gy, wallH)
+                        )
+                        val verticesEast = listOf(
+                            projectToCameraSpace(gx + w, gy, 0f),
+                            projectToCameraSpace(gx + w, gy + h, 0f),
+                            projectToCameraSpace(gx + w, gy + h, wallH),
+                            projectToCameraSpace(gx + w, gy, wallH)
+                        )
+
+                        // Relative back-to-front face drawing order within the wall segment
+                        val faces = listOf(
+                            Pair(verticesTop, wallTopColor),
+                            Pair(verticesNorth, wallSideColor),
+                            Pair(verticesSouth, wallSideColor),
+                            Pair(verticesWest, wallColor),
+                            Pair(verticesEast, wallColor)
+                        ).map { p ->
+                            val avgD = p.first.map { it.y }.average().toFloat()
+                            Triple(p.first, p.second, avgD)
+                        }.sortedByDescending { it.third }
+
+                        faces.forEach { face ->
+                            val pList = clipFaceAndProject(face.first)
+                            if (pList.size >= 3) {
+                                val path = Path().apply {
+                                    moveTo(pList[0].x, pList[0].y)
+                                    for (m in 1 until pList.size) {
+                                        lineTo(pList[m].x, pList[m].y)
+                                    }
+                                    close()
+                                }
+                                drawPath(path, brush = SolidColor(face.second))
+                                // Highlight wall seam corner lines
+                                drawPath(path, brush = SolidColor(Color.White.copy(alpha = 0.05f)), style = Stroke(1f))
+                            }
+                        }
                     }
-                    is Renderable.Decor -> {
-                        val decor = renderable.decor
-                        val topHue = Color(android.graphics.Color.parseColor(decor.colorHex))
-                        val frontHue = topHue.copy(alpha = 0.85f)
-                        val sideHue = topHue.copy(alpha = 0.7f)
+                    2 -> {
+                        val decor = renderable.data as com.example.ui.game.DecorObject
+                        val col = Color(android.graphics.Color.parseColor(decor.colorHex))
+                        val colDark = col.copy(red = col.red * 0.72f, green = col.green * 0.72f, blue = col.blue * 0.72f)
+                        val colLight = col.copy(red = (col.red * 1.15f).coerceIn(0f, 1f), green = (col.green * 1.15f).coerceIn(0f, 1f), blue = (col.blue * 1.15f).coerceIn(0f, 1f))
 
-                        drawPerspective3DBox(
-                            gx = decor.x,
-                            gy = decor.y,
-                            w = decor.width,
-                            h = decor.height,
-                            zHeight = 0.65f,
-                            px = px,
-                            py = py,
-                            tileSize = tileSize,
-                            rotationRad = rotRad,
-                            tiltRad = tiltRad,
-                            halfW = halfW,
-                            halfH = halfH,
-                            topColor = topHue,
-                            sideColor = sideHue,
-                            frontColor = frontHue
+                        val decH = 0.8f
+                        val top = listOf(
+                            projectToCameraSpace(decor.x, decor.y, decH),
+                            projectToCameraSpace(decor.x + decor.width, decor.y, decH),
+                            projectToCameraSpace(decor.x + decor.width, decor.y + decor.height, decH),
+                            projectToCameraSpace(decor.x, decor.y + decor.height, decH)
                         )
+                        val front = listOf(
+                            projectToCameraSpace(decor.x, decor.y + decor.height, 0f),
+                            projectToCameraSpace(decor.x + decor.width, decor.y + decor.height, 0f),
+                            projectToCameraSpace(decor.x + decor.width, decor.y + decor.height, decH),
+                            projectToCameraSpace(decor.x, decor.y + decor.height, decH)
+                        )
+                        val west = listOf(
+                            projectToCameraSpace(decor.x, decor.y, 0f),
+                            projectToCameraSpace(decor.x, decor.y + decor.height, 0f),
+                            projectToCameraSpace(decor.x, decor.y + decor.height, decH),
+                            projectToCameraSpace(decor.x, decor.y, decH)
+                        )
+                        val east = listOf(
+                            projectToCameraSpace(decor.x + decor.width, decor.y, 0f),
+                            projectToCameraSpace(decor.x + decor.width, decor.y + decor.height, 0f),
+                            projectToCameraSpace(decor.x + decor.width, decor.y + decor.height, decH),
+                            projectToCameraSpace(decor.x + decor.width, decor.y, decH)
+                        )
+
+                        val decFaces = listOf(
+                            Pair(top, colLight),
+                            Pair(front, col),
+                            Pair(west, colDark),
+                            Pair(east, colDark)
+                        ).map { p ->
+                            val avgD = p.first.map { it.y }.average().toFloat()
+                            Triple(p.first, p.second, avgD)
+                        }.sortedByDescending { it.third }
+
+                        decFaces.forEach { face ->
+                            val pList = clipFaceAndProject(face.first)
+                            if (pList.size >= 3) {
+                                val path = Path().apply {
+                                    moveTo(pList[0].x, pList[0].y)
+                                    for (m in 1 until pList.size) {
+                                        lineTo(pList[m].x, pList[m].y)
+                                    }
+                                    close()
+                                }
+                                drawPath(path, brush = SolidColor(face.second))
+                                drawPath(path, brush = SolidColor(Color.Black.copy(alpha = 0.15f)), style = Stroke(1.5f))
+                            }
+                        }
                     }
-                    is Renderable.Spot -> {
-                        val spot = renderable.spot
-                        val blockTopColor = if (spot.isSearched) Color(0xFF546E7A) else Color(0xFFFFB74D)
-                        drawPerspective3DBox(
-                            gx = spot.gridX + 0.1f,
-                            gy = spot.gridY + 0.1f,
-                            w = 0.8f,
-                            h = 0.8f,
-                            zHeight = 0.55f,
-                            px = px,
-                            py = py,
-                            tileSize = tileSize,
-                            rotationRad = rotRad,
-                            tiltRad = tiltRad,
-                            halfW = halfW,
-                            halfH = halfH,
-                            topColor = blockTopColor,
-                            sideColor = Color(0xFF37474F),
-                            frontColor = Color(0xFF455A64)
+                    3 -> {
+                        val spot = renderable.data as com.example.ui.game.KeySpotState
+                        val isSearched = spot.isSearched
+                        val baseCol = if (isSearched) Color(0xFF5D4037) else Color(0xFFE65100)
+                        val sideCol = Color(0xFF3E2723)
+                        val topCol = if (isSearched) Color(0xFF8D6E63) else Color(0xFFFFB74D)
+
+                        val gx = spot.gridX + 0.12f
+                        val gy = spot.gridY + 0.12f
+                        val w = 0.76f
+                        val h = 0.76f
+                        val cabH = 0.72f
+
+                        val top = listOf(
+                            projectToCameraSpace(gx, gy, cabH),
+                            projectToCameraSpace(gx + w, gy, cabH),
+                            projectToCameraSpace(gx + w, gy + h, cabH),
+                            projectToCameraSpace(gx, gy + h, cabH)
+                        )
+                        val front = listOf(
+                            projectToCameraSpace(gx, gy + h, 0f),
+                            projectToCameraSpace(gx + w, gy + h, 0f),
+                            projectToCameraSpace(gx + w, gy + h, cabH),
+                            projectToCameraSpace(gx, gy + h, cabH)
+                        )
+                        val west = listOf(
+                            projectToCameraSpace(gx, gy, 0f),
+                            projectToCameraSpace(gx, gy + h, 0f),
+                            projectToCameraSpace(gx, gy + h, cabH),
+                            projectToCameraSpace(gx, gy, cabH)
+                        )
+                        val east = listOf(
+                            projectToCameraSpace(gx + w, gy, 0f),
+                            projectToCameraSpace(gx + w, gy + h, 0f),
+                            projectToCameraSpace(gx + w, gy + h, cabH),
+                            projectToCameraSpace(gx + w, gy, cabH)
                         )
 
-                        // Highlight aura if nearby
-                        val cbPos = project(spot.gridX + 0.5f, spot.gridY + 0.5f, 0.25f, px, py, tileSize, rotRad, tiltRad, halfW, halfH)
+                        val spotFaces = listOf(
+                            Pair(top, topCol),
+                            Pair(front, baseCol),
+                            Pair(west, sideCol),
+                            Pair(east, sideCol)
+                        ).map { p ->
+                            val avgD = p.first.map { it.y }.average().toFloat()
+                            Triple(p.first, p.second, avgD)
+                        }.sortedByDescending { it.third }
+
+                        spotFaces.forEach { face ->
+                            val pList = clipFaceAndProject(face.first)
+                            if (pList.size >= 3) {
+                                val path = Path().apply {
+                                    moveTo(pList[0].x, pList[0].y)
+                                    for (m in 1 until pList.size) {
+                                        lineTo(pList[m].x, pList[m].y)
+                                    }
+                                    close()
+                                }
+                                drawPath(path, brush = SolidColor(face.second))
+                                drawPath(path, brush = SolidColor(Color.White.copy(alpha = 0.2f)), style = Stroke(1.5f))
+
+                                // If drawing the FRONT face, draw cupboard dresser handles!
+                                if (face.first === front) {
+                                    // Golden handle lines drawn centered
+                                    val leftMid = Offset(
+                                        pList[0].x + (pList[3].x - pList[0].x) * 0.5f,
+                                        pList[0].y + (pList[3].y - pList[0].y) * 0.5f
+                                    )
+                                    val rightMid = Offset(
+                                        pList[1].x + (pList[2].x - pList[1].x) * 0.5f,
+                                        pList[1].y + (pList[2].y - pList[1].y) * 0.5f
+                                    )
+                                    val handleL = Offset(
+                                        leftMid.x + (rightMid.x - leftMid.x) * 0.35f,
+                                        leftMid.y + (rightMid.y - leftMid.y) * 0.35f
+                                    )
+                                    val handleR = Offset(
+                                        leftMid.x + (rightMid.x - leftMid.x) * 0.65f,
+                                        leftMid.y + (rightMid.y - leftMid.y) * 0.65f
+                                    )
+                                    drawLine(Color(0xFFFFA000), handleL, handleR, 4f)
+                                }
+                            }
+                        }
+
+                        // Proximity highlighted circle overlay and billboard labeled overlay if near
                         val spotPos = Point2D(spot.gridX + 0.5f, spot.gridY + 0.5f)
-                        val distToTarget = player.gridPos.distanceTo(spotPos)
-                        if (distToTarget < 1.1f && !spot.isSearched) {
+                        val spotDist = player.gridPos.distanceTo(spotPos)
+                        if (spotDist < 1.15f && !isSearched) {
+                            val spotCam = projectToCameraSpace(spot.gridX + 0.5f, spot.gridY + 0.5f, 0.4f)
+                            if (spotCam.y > 0.05f) {
+                                val sx = halfW + (spotCam.x / spotCam.y) * halfW * fovScale
+                                val sy = halfH - (spotCam.z / spotCam.y) * halfH * fovScale
+                                drawCircle(
+                                    color = Color(0xFFFFB74D).copy(alpha = 0.4f + sin(elapsed * 7f) * 0.15f),
+                                    radius = (width / spotCam.y) * 0.045f,
+                                    center = Offset(sx, sy),
+                                    style = Stroke(2.dp.toPx())
+                                )
+                            }
+                        }
+                    }
+                    4 -> {
+                        val mom = renderable.data as com.example.ui.game.MomState
+                        val momCam = projectToCameraSpace(mom.gridPos.x, mom.gridPos.y, 0.5f)
+
+                        if (momCam.y > 0.07f) {
+                            // 1. Draw Ground search indicator vision flashlight cone
+                            val fovRadM = mom.visionAngleDegree * PI.toFloat() / 180f
+                            val startAngle = mom.headingAngle - fovRadM / 2
+                            val endAngle = mom.headingAngle + fovRadM / 2
+                            val stepCount = 14
+                            val conePoints = mutableListOf<LocalPoint3D>()
+                            // Start apex at Mom's feet
+                            conePoints.add(projectToCameraSpace(mom.gridPos.x, mom.gridPos.y, 0f))
+                            for (m in 0..stepCount) {
+                                val frac = m.toFloat() / stepCount
+                                val rayAngle = startAngle + (endAngle - startAngle) * frac
+                                val gx = mom.gridPos.x + cos(rayAngle) * mom.visionRange
+                                val gy = mom.gridPos.y + sin(rayAngle) * mom.visionRange
+                                conePoints.add(projectToCameraSpace(gx, gy, 0f))
+                            }
+                            val coneScr = clipFaceAndProject(conePoints)
+                            if (coneScr.size >= 3) {
+                                val path = Path().apply {
+                                    moveTo(coneScr[0].x, coneScr[0].y)
+                                    for (k in 1 until coneScr.size) {
+                                        lineTo(coneScr[k].x, coneScr[k].y)
+                                    }
+                                    close()
+                                }
+                                val beamColor = if (mom.isChasing) Color(0x66E53935) else Color(0x3DFFD54F)
+                                drawPath(path, brush = SolidColor(beamColor))
+                            }
+
+                            // 2. Draw base shadow circle on floor
+                            val mBase = projectToCameraSpace(mom.gridPos.x, mom.gridPos.y, 0f)
+                            val mBaseScr = clipFaceAndProject(listOf(mBase))
+                            if (mBaseScr.isNotEmpty()) {
+                                drawCircle(
+                                    color = Color.Black.copy(alpha = 0.5f),
+                                    radius = (width / momCam.y) * 0.043f,
+                                    center = mBaseScr[0]
+                                )
+                                // Red hazard outline under chassis if chasing
+                                if (mom.isChasing) {
+                                    drawCircle(
+                                        color = Color(0xFFE53935).copy(alpha = 0.5f + abs(sin(elapsed * 10f)) * 0.4f),
+                                        radius = (width / momCam.y) * (0.045f + sin(elapsed * 8f) * 0.01f),
+                                        center = mBaseScr[0],
+                                        style = Stroke(2.5.dp.toPx())
+                                    )
+                                }
+                            }
+
+                            // 3. Draw Mom billboard sprite card
+                            val mTop = projectToCameraSpace(mom.gridPos.x, mom.gridPos.y, 1.25f)
+                            val mTopScr = clipFaceAndProject(listOf(mTop))
+                            val mBaseScrPt = mBaseScr.firstOrNull()
+                            val mTopScrPt = mTopScr.firstOrNull()
+
+                            if (mBaseScrPt != null && mTopScrPt != null) {
+                                val sY = abs(mBaseScrPt.y - mTopScrPt.y)
+                                val sX = sY * 0.72f
+                                val headY = mTopScrPt.y + sY * 0.15f
+                                val headR = sY * 0.18f
+
+                                // Draw Apron mother dress (trapezoid body)
+                                val dressPath = Path().apply {
+                                    moveTo(mBaseScrPt.x - sX * 0.5f, mBaseScrPt.y)
+                                    lineTo(mBaseScrPt.x - sX * 0.28f, headY + headR)
+                                    lineTo(mBaseScrPt.x + sX * 0.28f, headY + headR)
+                                    lineTo(mBaseScrPt.x + sX * 0.5f, mBaseScrPt.y)
+                                    close()
+                                }
+                                val dressColor = if (mom.isChasing) Color(0xFFB71C1C) else Color(0xFFC62828)
+                                drawPath(dressPath, brush = SolidColor(dressColor))
+
+                                // Draw white kitchen apron overlay
+                                val apronPath = Path().apply {
+                                    moveTo(mBaseScrPt.x - sX * 0.28f, mBaseScrPt.y)
+                                    lineTo(mBaseScrPt.x - sX * 0.15f, headY + headR + (mBaseScrPt.y - headY) * 0.2f)
+                                    lineTo(mBaseScrPt.x + sX * 0.15f, headY + headR + (mBaseScrPt.y - headY) * 0.2f)
+                                    lineTo(mBaseScrPt.x + sX * 0.28f, mBaseScrPt.y)
+                                    close()
+                                }
+                                drawPath(apronPath, brush = SolidColor(Color(0xFFFAFAFA)))
+
+                                // Draw Skin head circle
+                                drawCircle(
+                                    color = Color(0xFFFFCCBC),
+                                    radius = headR,
+                                    center = Offset(mBaseScrPt.x, headY)
+                                )
+
+                                // Draw Motherly grey-brown hair bun on top of head
+                                drawCircle(
+                                    color = Color(0xFF5D4037),
+                                    radius = headR * 0.44f,
+                                    center = Offset(mBaseScrPt.x, headY - headR * 0.9f)
+                                )
+
+                                // Draw glasses (spectacles loops)
+                                val eyeSep = headR * 0.45f
+                                val glassesColor = if (mom.isChasing) Color(0xFFE53935) else Color.Black
+                                drawCircle(
+                                    color = Color.White,
+                                    radius = headR * 0.28f,
+                                    center = Offset(mBaseScrPt.x - eyeSep, headY),
+                                    style = Stroke(2f)
+                                )
+                                drawCircle(
+                                    color = Color.White,
+                                    radius = headR * 0.28f,
+                                    center = Offset(mBaseScrPt.x + eyeSep, headY),
+                                    style = Stroke(2f)
+                                )
+                                // Glasses rims / connectors
+                                drawCircle(
+                                    color = glassesColor,
+                                    radius = headR * 0.3f,
+                                    center = Offset(mBaseScrPt.x - eyeSep, headY),
+                                    style = Stroke(1.8.dp.toPx())
+                                )
+                                drawCircle(
+                                    color = glassesColor,
+                                    radius = headR * 0.3f,
+                                    center = Offset(mBaseScrPt.x + eyeSep, headY),
+                                    style = Stroke(1.8.dp.toPx())
+                                )
+                                drawLine(glassesColor, Offset(mBaseScrPt.x - eyeSep + headR * 0.15f, headY), Offset(mBaseScrPt.x + eyeSep - headR * 0.15f, headY), 2.5.dp.toPx())
+
+                                // Beady glow eyes inside glasses loop
+                                val eyeGlowColor = if (mom.isChasing) Color.Red else Color.Black
+                                drawCircle(eyeGlowColor, radius = headR * 0.1f, center = Offset(mBaseScrPt.x - eyeSep, headY))
+                                drawCircle(eyeGlowColor, radius = headR * 0.1f, center = Offset(mBaseScrPt.x + eyeSep, headY))
+
+                                // If chasing, draw angry expression indicators (flashing red sweat lines or exclamation!)
+                                if (mom.isChasing) {
+                                    // Angry red eyebrow lines above glasses
+                                    drawLine(Color.Red, Offset(mBaseScrPt.x - headR * 0.9f, headY - headR * 0.4f), Offset(mBaseScrPt.x - headR * 0.1f, headY - headR * 0.2f), 3f)
+                                    drawLine(Color.Red, Offset(mBaseScrPt.x + headR * 0.9f, headY - headR * 0.4f), Offset(mBaseScrPt.x + headR * 0.1f, headY - headR * 0.2f), 3f)
+
+                                    // Spooky alert bubble above Bun
+                                    val alertCenter = Offset(mBaseScrPt.x, headY - headR * 2.1f)
+                                    val alertR = headR * 0.48f
+                                    drawCircle(Color(0xFFE53935), radius = alertR, center = alertCenter)
+                                    // draw Exclamation point!
+                                    drawLine(Color.White, Offset(alertCenter.x, alertCenter.y - alertR * 0.4f), Offset(alertCenter.x, alertCenter.y + alertR * 0.05f), 3f)
+                                    drawCircle(Color.White, radius = 2f, center = Offset(alertCenter.x, alertCenter.y + alertR * 0.45f))
+                                }
+                            }
+                        }
+                    }
+                    5 -> {
+                        val exPos = renderable.data as Point2D
+                        val ex = exPos.x
+                        val ey = exPos.y
+
+                        val gateW = 0.9f
+                        val gateH = 1.4f
+
+                        // Draw a glowing emerald green exit frame
+                        val verticesFrame = listOf(
+                            projectToCameraSpace(ex - gateW / 2, ey, 0f),
+                            projectToCameraSpace(ex + gateW / 2, ey, 0f),
+                            projectToCameraSpace(ex + gateW / 2, ey, gateH),
+                            projectToCameraSpace(ex - gateW / 2, ey, gateH)
+                        )
+                        val frameScr = clipFaceAndProject(verticesFrame)
+                        if (frameScr.size >= 4) {
+                            val path = Path().apply {
+                                moveTo(frameScr[0].x, frameScr[0].y)
+                                for (k in 1 until frameScr.size) {
+                                    lineTo(frameScr[k].x, frameScr[k].y)
+                                }
+                                close()
+                            }
+                            // Glow fill
+                            drawPath(path, brush = SolidColor(Color(0x334CAF50)))
+                            // Emerald border
+                            drawPath(path, brush = SolidColor(Color(0xFF81C784)), style = Stroke(4.dp.toPx()))
+
+                            // Draw "THOÁT / EXIT" sign board on top of door in 3D
+                            val boardTop = Offset(
+                                frameScr[3].x + (frameScr[2].x - frameScr[3].x) * 0.5f,
+                                frameScr[3].y + (frameScr[2].y - frameScr[3].y) * 0.5f
+                            )
+                            val textR = (width / renderable.depth) * 0.1f
                             drawCircle(
-                                color = Color(0xFFFFD54F).copy(alpha = 0.41f + sin(elapsed * 6f) * 0.15f),
-                                radius = tileSize * 0.52f,
-                                center = cbPos,
-                                style = Stroke(with(density) { 2.dp.toPx() })
+                                color = Color(0xD91B5E20),
+                                radius = textR * 0.4f,
+                                center = Offset(boardTop.x, boardTop.y - textR * 0.12f)
+                            )
+                            // Sign border
+                            drawCircle(
+                                color = Color(0xFF4CAF50),
+                                radius = textR * 0.41f,
+                                center = Offset(boardTop.x, boardTop.y - textR * 0.12f),
+                                style = Stroke(1.5f)
                             )
                         }
                     }
-                    is Renderable.Player -> {
-                        val basePos = project(px, py, 0f, px, py, tileSize, rotRad, tiltRad, halfW, halfH)
-                        val shadowScale = (1f - (player.zOffset / 4f)).coerceIn(0.2f, 1f)
-                        drawCircle(
-                            color = Color.Black.copy(alpha = 0.45f * shadowScale),
-                            radius = (tileSize * 0.3f) * shadowScale,
-                            center = basePos
+                }
+            }
+
+            // 4. DRAW BOY PLAYER HANDS HUD (First-person hands overlay!)
+            // Reaches from bottom left/right into screen and bobs nicely
+            if (!player.isHiding) {
+                val handTime = elapsed * 8f
+                // Lat/Vert displacement bob from running
+                val handBobX = if (isMoving) sin(handTime) * 14.dp.toPx() else 0f
+                val handBobY = if (isMoving) abs(cos(handTime)) * 10.dp.toPx() else 0f
+
+                // Left Boy Hand (Blue sleeve + peach skin fist)
+                val leftSleevePath = Path().apply {
+                    moveTo(width * 0.15f + handBobX, height)
+                    lineTo(width * 0.26f + handBobX, height * 0.81f + handBobY)
+                    lineTo(width * 0.36f + handBobX, height * 0.86f + handBobY)
+                    lineTo(width * 0.28f + handBobX, height)
+                    close()
+                }
+                drawPath(leftSleevePath, brush = SolidColor(Color(0xFF0288D1))) // boy shirt blue
+                drawCircle(
+                    color = Color(0xFFFFAB91), // peach skin
+                    radius = 24.dp.toPx(),
+                    center = Offset(width * 0.31f + handBobX, height * 0.83f + handBobY)
+                )
+
+                // Right Boy Hand
+                val rightSleevePath = Path().apply {
+                    moveTo(width * 0.85f - handBobX, height)
+                    lineTo(width * 0.74f - handBobX, height * 0.81f + handBobY)
+                    lineTo(width * 0.64f - handBobX, height * 0.86f + handBobY)
+                    lineTo(width * 0.72f - handBobX, height)
+                    close()
+                }
+                drawPath(rightSleevePath, brush = SolidColor(Color(0xFF0288D1)))
+                drawCircle(
+                    color = Color(0xFFFFAB91),
+                    radius = 24.dp.toPx(),
+                    center = Offset(width * 0.69f - handBobX, height * 0.83f + handBobY)
+                )
+            }
+        }
+
+        // 5. SCREEN FLASH ALARM (CHASE THRILL ALERT RED OVERLAY SCREEN VIGNETTE)
+        if (isChasing) {
+            val chaseAlpha by rememberInfiniteTransition(label = "").animateFloat(
+                initialValue = 0.1f,
+                targetValue = 0.42f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(420, easing = LinearEasing),
+                    repeatMode = RepeatMode.Reverse
+                ),
+                label = ""
+            )
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .border(BorderStroke(12.dp, Color(0xFFDE3226).copy(alpha = chaseAlpha + 0.3f)))
+                    .background(Color(0xFFDE3226).copy(alpha = chaseAlpha))
+            )
+        }
+
+        // 6. DETECTED BIG CHASE ALARM BANNER
+        if (isChasing) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 115.dp)
+                    .align(Alignment.TopCenter),
+                contentAlignment = Alignment.Center
+            ) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFDE3226)),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(2.dp, Color.White),
+                    modifier = Modifier.padding(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Warning,
+                            contentDescription = "Alert",
+                            tint = Color.White,
+                            modifier = Modifier.size(24.dp)
                         )
-
-                        val jumpZ = player.zOffset * 0.45f
-                        val bodyHeightFactor = if (player.isCrouched) 0.48f else 0.88f
-                        val topZ = bodyHeightFactor + jumpZ
-
-                        val baseJumpZ = jumpZ
-                        val baseProjected = project(px, py, baseJumpZ, px, py, tileSize, rotRad, tiltRad, halfW, halfH)
-                        val topProjected = project(px, py, topZ, px, py, tileSize, rotRad, tiltRad, halfW, halfH)
-
-                        drawPerspective3DPlayer(
-                            cx = baseProjected.x,
-                            cy = baseProjected.y,
-                            topX = topProjected.x,
-                            topY = topProjected.y,
-                            r = tileSize * 0.28f,
-                            isCrouched = player.isCrouched,
-                            headingAngle = player.headingAngle,
-                            density = density
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = "MẸ ĐÃ PHÁT HIỆN!",
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.Black,
+                            color = Color.White,
+                            letterSpacing = 2.sp
                         )
                     }
-                    is Renderable.Mom -> {
-                        val mom = renderable.mom
-                        val basePos = project(mom.gridPos.x, mom.gridPos.y, 0f, px, py, tileSize, rotRad, tiltRad, halfW, halfH)
+                }
+            }
+        }
 
-                        // Draw vision cones projected on floor
-                        drawVisionCone3D(
-                            centerX = basePos.x,
-                            centerY = basePos.y,
-                            angleRad = mom.headingAngle,
-                            fovDeg = mom.visionAngleDegree,
-                            rangePx = mom.visionRange * tileSize,
-                            px = px,
-                            py = py,
-                            momGridPos = mom.gridPos,
-                            tileSize = tileSize,
-                            rotRad = rotRad,
-                            tiltRad = tiltRad,
-                            halfW = halfW,
-                            halfH = halfH,
-                            density = density
+        // 7. KEY COLLECED NOTICE BANNER
+        if (keyFoundMessage != null) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 170.dp)
+                    .align(Alignment.TopCenter),
+                contentAlignment = Alignment.Center
+            ) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFFFB74D)),
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(2.dp, Color.White),
+                    modifier = Modifier.padding(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 22.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Star,
+                            contentDescription = "Key",
+                            tint = Color.White,
+                            modifier = Modifier.size(24.dp)
                         )
-
-                        // Base floor shadow
-                        drawCircle(
-                            color = Color.Black.copy(alpha = 0.45f),
-                            radius = tileSize * 0.32f,
-                            center = basePos
-                        )
-
-                        val topProjected = project(mom.gridPos.x, mom.gridPos.y, 1.15f, px, py, tileSize, rotRad, tiltRad, halfW, halfH)
-                        drawPerspective3DMom(
-                            cx = basePos.x,
-                            cy = basePos.y,
-                            topX = topProjected.x,
-                            topY = topProjected.y,
-                            r = tileSize * 0.31f,
-                            height = tileSize * 1.15f,
-                            headingAngle = mom.headingAngle,
-                            elapsed = elapsed,
-                            density = density
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = keyFoundMessage!!,
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.Black
                         )
                     }
+                }
+            }
+        }
+
+        // 8. HIDING IN CABINET FULL INTERIOR SCREEN OVERLAY
+        if (player.isHiding) {
+            // Dark cabin grid mask
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.78f))
+                    .border(BorderStroke(24.dp, Color(0xFF1A120B))),
+                contentAlignment = Alignment.Center
+            ) {
+                // Slat Blinds Shadows Looking Out!
+                Column(
+                    modifier = Modifier.fillMaxSize(),
+                    verticalArrangement = Arrangement.SpaceEvenly
+                ) {
+                    repeat(6) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(55.dp)
+                                .background(Color.Black.copy(alpha = 0.88f))
+                        )
+                    }
+                }
+
+                // Centered instructions HUD
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier
+                        .background(Color(0xFF2C1A11), RoundedCornerShape(14.dp))
+                        .border(1.5.dp, Color(0xFFFFA000), RoundedCornerShape(14.dp))
+                        .padding(horizontal = 24.dp, vertical = 14.dp)
+                        .widthIn(max = 420.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Info,
+                        contentDescription = "Hiding",
+                        tint = Color(0xFFFFD54F),
+                        modifier = Modifier.size(34.dp)
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text(
+                        text = "BẠN ĐANG TRỐN TRONG TỦ...  🤫",
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Black,
+                        color = Color.White,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Mẹ không thấy bạn ở đây. Hãy chờ mẹ đi khuất rồi mới bấm THOÁT TỦ để hành động tiếp!",
+                        fontSize = 11.sp,
+                        color = Color(0xFFB0BEC5),
+                        textAlign = TextAlign.Center,
+                        lineHeight = 15.sp
+                    )
+                }
+            }
+        }
+
+        // 9. COZY BOY STATUS HUD PROFILE PHOTO IN TOP-LEFT
+        Box(
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .statusBarsPadding()
+                .padding(top = 14.dp, start = 72.dp)
+                .size(54.dp)
+                .clip(CircleShape)
+                .background(Color(0xE61E2130))
+                .border(2.dp, if (isChasing) Color(0xFFDE3226) else Color(0xFF29B6F6), CircleShape)
+        ) {
+            Surface(
+                modifier = Modifier.fillMaxSize(),
+                color = Color.Transparent
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    // Emoji changes in real time based on boy states!
+                    val faceEmoji = when {
+                        viewModel.currentScreen.value == GameViewModel.Screen.GAME_OVER -> "😭"
+                        isChasing -> "😱"
+                        player.isHiding -> "🤫"
+                        player.isCrouched -> "😏"
+                        else -> "👦"
+                    }
+                    Text(
+                        text = faceEmoji,
+                        fontSize = 26.sp
+                    )
                 }
             }
         }
@@ -1223,12 +1835,12 @@ fun GamePlayScreen(viewModel: GameViewModel) {
             ) {
                 // CROUCH posture button
                 IconButton(
-                    onClick = { viewModel.toggleCrouch() },
+                    onClick = { if (!player.isHiding) viewModel.toggleCrouch() },
                     modifier = Modifier
                         .size(54.dp)
                         .shadow(6.dp, CircleShape)
                         .background(
-                            if (player.isCrouched) Color(0xFFDE3226) else Color(0xE61E2130),
+                            if (player.isCrouched) Color(0xFF29B6F6) else Color(0xE61E2130),
                             CircleShape
                         )
                         .border(
@@ -1248,8 +1860,8 @@ fun GamePlayScreen(viewModel: GameViewModel) {
 
                 // JUMP springboard button
                 IconButton(
-                    onClick = { viewModel.triggerJump() },
-                    enabled = !player.isJumping,
+                    onClick = { if (!player.isHiding) viewModel.triggerJump() },
+                    enabled = !player.isJumping && !player.isHiding,
                     modifier = Modifier
                         .size(54.dp)
                         .shadow(6.dp, CircleShape)
@@ -1258,65 +1870,114 @@ fun GamePlayScreen(viewModel: GameViewModel) {
                         .testTag("jump_button")
                 ) {
                     Icon(
-                        imageVector = Icons.Default.ArrowForward,
+                        imageVector = Icons.Default.KeyboardArrowUp,
                         contentDescription = "Jump",
                         tint = Color.White,
-                        modifier = Modifier.size(26.dp).rotate(-90f)
+                        modifier = Modifier.size(26.dp)
                     )
                 }
 
-                // CABINET INTERACT pulsing golden action button
-                // Matches nearest cabinets in searchable range
+                // HIDING AND SEARCHING DECORTATIONS ACTIONS
                 val nearbySpot = spots.find { s ->
                     val sPos = Point2D(s.gridX + 0.5f, s.gridY + 0.5f)
-                    player.gridPos.distanceTo(sPos) < 1.1f && !s.isSearched
+                    player.gridPos.distanceTo(sPos) < 1.15f
+                }
+                
+                val nearbyDecorCabinet = activeLevelData.decors.find { d ->
+                    val dPos = Point2D(d.x + d.width / 2f, d.y + d.height / 2f)
+                    player.gridPos.distanceTo(dPos) < 1.15f
                 }
 
-                if (nearbySpot != null) {
-                    Box(modifier = Modifier.wrapContentSize(), contentAlignment = Alignment.Center) {
-                        Button(
-                            onClick = {
-                                if (!searching) {
-                                    viewModel.startSearchingSpot(nearbySpot)
-                                } else {
-                                    viewModel.cancelSearchingSpot()
+                val targetCabinetId = nearbySpot?.id ?: nearbyDecorCabinet?.id
+
+                if (player.isHiding) {
+                    // EXIT TỦ BUTTON
+                    Button(
+                        onClick = {
+                            val activeCabinetId = player.hidingInId
+                            if (activeCabinetId != null) {
+                                viewModel.toggleHidingInCabinet(activeCabinetId, false)
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDE3226)),
+                        shape = CircleShape,
+                        modifier = Modifier
+                            .size(76.dp)
+                            .shadow(8.dp, CircleShape)
+                            .border(2.dp, Color.White, CircleShape),
+                        contentPadding = PaddingValues(0.dp)
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(Icons.Default.ExitToApp, contentDescription = "Thoát tủ", tint = Color.White, modifier = Modifier.size(26.dp))
+                            Text("THOÁT TỦ", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                        }
+                    }
+                } else if (targetCabinetId != null) {
+                    // VÀO TRỐN TỦ BUTTON
+                    Button(
+                        onClick = {
+                            viewModel.toggleHidingInCabinet(targetCabinetId, true)
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50)),
+                        shape = CircleShape,
+                        modifier = Modifier
+                            .size(76.dp)
+                            .shadow(8.dp, CircleShape)
+                            .border(2.dp, Color.White, CircleShape),
+                        contentPadding = PaddingValues(0.dp)
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(Icons.Default.Home, contentDescription = "Vài Trốn", tint = Color.White, modifier = Modifier.size(26.dp))
+                            Text("VÀO TRỐN", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                        }
+                    }
+
+                    // If it is also a searchable spot, show drawer key search button beside it!
+                    if (nearbySpot != null && !nearbySpot.isSearched) {
+                        Box(modifier = Modifier.wrapContentSize(), contentAlignment = Alignment.Center) {
+                            Button(
+                                onClick = {
+                                    if (!searching) {
+                                        viewModel.startSearchingSpot(nearbySpot)
+                                    } else {
+                                        viewModel.cancelSearchingSpot()
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = if (searching) Color(0xFFC62828) else Color(0xFFFFA000)
+                                ),
+                                shape = CircleShape,
+                                modifier = Modifier
+                                    .size(72.dp)
+                                    .shadow(8.dp, CircleShape)
+                                    .border(2.dp, Color.White, CircleShape)
+                                    .testTag("interact_button"),
+                                contentPadding = PaddingValues(0.dp)
+                            ) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Icon(
+                                        imageVector = if (searching) Icons.Default.Close else Icons.Default.Search,
+                                        contentDescription = "Search Drawer",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(26.dp)
+                                    )
+                                    Text(
+                                        text = if (searching) "HỦY" else "TÌM KHÓA",
+                                        fontSize = 9.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White
+                                    )
                                 }
-                            },
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = if (searching) Color(0xFFC62828) else Color(0xFFFFA000)
-                            ),
-                            shape = CircleShape,
-                            modifier = Modifier
-                                .size(72.dp)
-                                .shadow(8.dp, CircleShape)
-                                .border(2.dp, Color.White, CircleShape)
-                                .testTag("interact_button"),
-                            contentPadding = PaddingValues(0.dp)
-                        ) {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Icon(
-                                    imageVector = if (searching) Icons.Default.Close else Icons.Default.Search,
-                                    contentDescription = "Search Drawer",
-                                    tint = Color.White,
-                                    modifier = Modifier.size(28.dp)
-                                )
-                                Text(
-                                    text = if (searching) "HủY" else "TÌM KIẾM",
-                                    fontSize = 9.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color.White
+                            }
+
+                            if (searching && activeSpot?.id == nearbySpot.id) {
+                                CircularProgressIndicator(
+                                    progress = { nearbySpot.searchProgress },
+                                    color = Color.White,
+                                    strokeWidth = 5.dp,
+                                    modifier = Modifier.size(72.dp)
                                 )
                             }
-                        }
-
-                        // Circular arc loading progress overlay
-                        if (searching && activeSpot?.id == nearbySpot.id) {
-                            CircularProgressIndicator(
-                                progress = { nearbySpot.searchProgress },
-                                color = Color.White,
-                                strokeWidth = 5.dp,
-                                modifier = Modifier.size(72.dp)
-                            )
                         }
                     }
                 }

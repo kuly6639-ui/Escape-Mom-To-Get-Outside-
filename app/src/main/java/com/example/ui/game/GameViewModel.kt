@@ -79,8 +79,66 @@ class GameViewModel(
     private val _cameraRotation = MutableStateFlow(-30f) // default isometric -30deg angled perspective
     val cameraRotation: StateFlow<Float> = _cameraRotation.asStateFlow()
 
-    private val _cameraTilt = MutableStateFlow(50f) // default tilt pitch degrees
+    private val _cameraTilt = MutableStateFlow(0f) // default tilt pitch degrees (looking straight ahead in first person!)
     val cameraTilt: StateFlow<Float> = _cameraTilt.asStateFlow()
+
+    private val _isChasing = MutableStateFlow(false)
+    val isChasing: StateFlow<Boolean> = _isChasing.asStateFlow()
+
+    private val _keyFoundMessage = MutableStateFlow<String?>(null)
+    val keyFoundMessage: StateFlow<String?> = _keyFoundMessage.asStateFlow()
+
+    fun onCameraRotateDrag(dx: Float, dy: Float) {
+        val player = _playerState.value
+        val sensYaw = 0.005f
+        val sensPitch = 0.4f // Pitch in degrees
+        
+        var newHeading = player.headingAngle + dx * sensYaw
+        while (newHeading < -PI) newHeading += (2 * PI).toFloat()
+        while (newHeading > PI) newHeading -= (2 * PI).toFloat()
+        
+        val newTilt = (_cameraTilt.value - dy * sensPitch).coerceIn(-40f, 40f)
+        
+        _playerState.value = player.copy(headingAngle = newHeading)
+        _cameraTilt.value = newTilt
+    }
+
+    fun triggerNotification(msg: String) {
+        viewModelScope.launch {
+            _keyFoundMessage.value = msg
+            delay(3500)
+            _keyFoundMessage.value = null
+        }
+    }
+
+    fun toggleHidingInCabinet(cabinetId: String, hide: Boolean) {
+        val player = _playerState.value
+        val level = _activeLevel.value ?: return
+        if (hide) {
+            // Find closet position
+            val spot = level.keySpots.find { it.id == cabinetId }
+            val proposedPos = if (spot != null) {
+                Point2D(spot.gridX + 0.5f, spot.gridY + 0.5f)
+            } else {
+                val dec = level.decors.find { it.id == cabinetId }
+                if (dec != null) Point2D(dec.x + dec.width / 2f, dec.y + dec.height / 2f) else player.gridPos
+            }
+            _playerState.value = player.copy(
+                isHiding = true,
+                hidingInId = cabinetId,
+                gridPos = proposedPos
+            )
+            audioEngine.playSfx(GameAudioEngine.SfxType.CROUCH)
+            _isSearching.value = false
+            _activeSearchSpot.value = null
+        } else {
+            _playerState.value = player.copy(
+                isHiding = false,
+                hidingInId = null
+            )
+            audioEngine.playSfx(GameAudioEngine.SfxType.CROUCH)
+        }
+    }
 
     fun rotateCameraLeft() {
         _cameraRotation.value = (_cameraRotation.value - 15f + 360f) % 360f
@@ -91,16 +149,16 @@ class GameViewModel(
     }
 
     fun tiltCameraUp() {
-        _cameraTilt.value = (_cameraTilt.value + 5f).coerceIn(30f, 75f)
+        _cameraTilt.value = (_cameraTilt.value + 5f).coerceIn(-40f, 40f)
     }
 
     fun tiltCameraDown() {
-        _cameraTilt.value = (_cameraTilt.value - 5f).coerceIn(30f, 75f)
+        _cameraTilt.value = (_cameraTilt.value - 5f).coerceIn(-40f, 40f)
     }
 
     // Joystick movement inputs
-    private var joystickX = 0f
-    private var joystickY = 0f
+    var joystickX = 0f
+    var joystickY = 0f
 
     // Running game loop status
     private var gameLoopJob: Job? = null
@@ -143,7 +201,7 @@ class GameViewModel(
     private fun loadLevel(levelId: Int) {
         val level = LevelsFactory.getLevel(levelId)
         _activeLevel.value = level
-        _playerState.value = PlayerState(gridPos = level.startPlayerPos)
+        _playerState.value = PlayerState(gridPos = level.startPlayerPos, headingAngle = 0f)
         _momsState.value = level.moms.map { it.copy() }
         _keySpotsState.value = level.keySpots.map { it.copy() }
         _timeSeconds.value = 0f
@@ -151,8 +209,10 @@ class GameViewModel(
         _activeSearchSpot.value = null
         joystickX = 0f
         joystickY = 0f
-        _cameraRotation.value = -30f
-        _cameraTilt.value = 50f
+        _cameraRotation.value = 0f
+        _cameraTilt.value = 0f
+        _isChasing.value = false
+        _keyFoundMessage.value = null
     }
 
     // Controls input callbacks
@@ -239,7 +299,7 @@ class GameViewModel(
 
         // 2. Handle Searching Cabinet Progress
         val activeSpot = _activeSearchSpot.value
-        if (_isSearching.value && activeSpot != null) {
+        if (_isSearching.value && activeSpot != null && !player.isHiding) {
             val updatedSpots = spots.map { s ->
                 if (s.id == activeSpot.id) {
                     val newProg = (s.searchProgress + delta * 0.8f).coerceIn(0f, 1f)
@@ -264,37 +324,38 @@ class GameViewModel(
                 if (match.containsKey) {
                     _playerState.value = player.copy(keysCollected = player.keysCollected + 1)
                     audioEngine.playSfx(GameAudioEngine.SfxType.KEY_PICKUP)
+                    triggerNotification("BẠN ĐÃ TÌM THẤY CHÌA KHÓA! (${_playerState.value.keysCollected}/${level.totalKeysRequired})")
                 } else {
                     audioEngine.playSfx(GameAudioEngine.SfxType.UNLOCK) // Empty click click
+                    triggerNotification("NGĂN KÉO RỖNG! Không có chìa khóa.")
                 }
             }
             // Cannot walk while actively searching shelves
             return
         }
 
-        // 3. Move Player
-        var speedMod = 2.4f // units per second basic
-        if (player.isCrouched) speedMod = 1.1f
+        // 3. Move Player (First Person Relative)
+        var resolvedPos = player.gridPos
+        if (!player.isHiding) {
+            var speedMod = 2.4f // units per second basic
+            if (player.isCrouched) speedMod = 1.1f
 
-        val dx = joystickX * speedMod * delta
-        val dy = joystickY * speedMod * delta
+            // In first person, we move relative to heading direction!
+            val cosHead = cos(player.headingAngle)
+            val sinHead = sin(player.headingAngle)
 
-        var proposedX = player.gridPos.x + dx
-        var proposedY = player.gridPos.y + dy
+            // joystickY: -1 is forward, 1 is backward
+            // joystickX: -1 is strafe left, 1 is strafe right
+            val dx = (cosHead * (-joystickY) - sinHead * joystickX) * speedMod * delta
+            val dy = (sinHead * (-joystickY) + cosHead * joystickX) * speedMod * delta
 
-        // Constrain player bounds
-        proposedX = proposedX.coerceIn(0.5f, level.widthCount - 0.5f)
-        proposedY = proposedY.coerceIn(0.5f, level.heightCount - 0.5f)
+            var proposedX = player.gridPos.x + dx
+            var proposedY = player.gridPos.y + dy
 
-        // Wall grid sliding collision resolution
-        val proposedPos = Point2D(proposedX, proposedY)
-        val resolvedPos = resolveWallCollision(proposedPos, level)
+            proposedX = proposedX.coerceIn(0.5f, level.widthCount - 0.5f)
+            proposedY = proposedY.coerceIn(0.5f, level.heightCount - 0.5f)
 
-        // Set facing direction angle from joy inputs if moving
-        val headingAngle = if (joystickX != 0f || joystickY != 0f) {
-            atan2(joystickY, joystickX)
-        } else {
-            player.headingAngle
+            resolvedPos = resolveWallCollision(Point2D(proposedX, proposedY), level)
         }
 
         // Update player jump parabolic height
@@ -308,14 +369,15 @@ class GameViewModel(
             }
         }
 
-        _playerState.value = player.copy(
+        val updatedPlayer = player.copy(
             gridPos = resolvedPos,
-            headingAngle = headingAngle,
             isJumping = isJumping,
             jumpProgress = jumpProg
         )
+        _playerState.value = updatedPlayer
 
-        // 4. Update the Mom(s) AI
+        // 4. Update the Mom(s) AI including pursuit/chase!
+        var anyMomChasing = false
         val updatedMoms = moms.map { mom ->
             var pos = mom.gridPos
             var currentIdx = mom.currentWaypointIndex
@@ -323,92 +385,153 @@ class GameViewModel(
             var heading = mom.headingAngle
             var lookAngle = mom.searchLookAngle
             var activePath = mom.pathNodes.toMutableList()
+            var chasing = mom.isChasing
+            var lastKnown = mom.lastKnownPlayerPos
+            var searchT = mom.chaseSearchTimer
 
-            if (waitTime > 0f) {
-                // Paused at waypoint, look back and forth (sweeping vision cone!)
-                waitTime -= delta
-                lookAngle = sin(_timeSeconds.value * 4f) * 0.5f // Sweep angle +/- 30 degrees
-                heading = atan2(
-                    mom.waypoints[currentIdx].y - mom.gridPos.y,
-                    mom.waypoints[currentIdx].x - mom.gridPos.x
-                ) + lookAngle
-            } else {
-                if (activePath.isEmpty()) {
-                    // Calculate path to current target waypoint
-                    val path = findPathForMom(pos, mom.waypoints[currentIdx], level)
-                    activePath = path.toMutableList()
-                }
+            // Can Mom spot the player now?
+            val isPlayerHiding = updatedPlayer.isHiding
+            val distToP = pos.distanceTo(updatedPlayer.gridPos)
+            var canSeeNow = false
 
-                if (activePath.isNotEmpty()) {
-                    val dest = activePath.first()
-                    val dist = pos.distanceTo(dest)
-                    if (dist < 0.15f) {
-                        activePath.removeAt(0)
-                        if (activePath.isEmpty()) {
-                            // Reached final waypoint destination! Start pause-searching look
-                            waitTime = 1.5f
-                            currentIdx = (currentIdx + 1) % mom.waypoints.size
-                        }
-                    } else {
-                        // Move step-by-step
-                        val angle = atan2(dest.y - pos.y, dest.x - pos.x)
-                        heading = angle
-                        lookAngle = 0f
-                        val stepDist = mom.speed * delta
-                        pos = Point2D(
-                            pos.x + cos(angle) * stepDist,
-                            pos.y + sin(angle) * stepDist
-                        )
+            if (!isPlayerHiding && distToP <= mom.visionRange) {
+                val angleToP = atan2(updatedPlayer.gridPos.y - pos.y, updatedPlayer.gridPos.x - pos.x)
+                var angleDiff = angleToP - heading
+                while (angleDiff < -PI) angleDiff += (2 * PI).toFloat()
+                while (angleDiff > PI) angleDiff -= (2 * PI).toFloat()
+
+                val viewHalfAngle = (mom.visionAngleDegree * PI / 180f) / 2f
+                if (abs(angleDiff) <= viewHalfAngle) {
+                    // Check if vision line is blocked by any walls
+                    val pathIsBlocked = isRayBlockedByWalls(pos, updatedPlayer.gridPos, level)
+                    if (!pathIsBlocked) {
+                        canSeeNow = true
                     }
-                } else {
-                    // Fallback if somehow path is completely empty
-                    waitTime = 1.5f
-                    currentIdx = (currentIdx + 1) % mom.waypoints.size
                 }
             }
+
+            if (canSeeNow) {
+                // Sighted! Trigger chase!
+                if (!chasing) {
+                    chasing = true
+                    audioEngine.playSfx(GameAudioEngine.SfxType.TRIGGER_ALERT) // Scary alarm alert sfx
+                    triggerNotification("MẸ ĐÃ PHÁT HIỆN! Chạy mau!")
+                }
+                lastKnown = updatedPlayer.gridPos
+                searchT = 3.5f // Reset pursuit look around timer
+                activePath.clear() // Recalculate immediate pursuit path
+            }
+
+            if (chasing) {
+                anyMomChasing = true
+                val dest = lastKnown ?: updatedPlayer.gridPos
+                val distToDest = pos.distanceTo(dest)
+
+                if (distToDest > 0.25f) {
+                    // Recalculate path to player/dest if path got empty
+                    if (activePath.isEmpty()) {
+                        activePath = findPathForMom(pos, dest, level).toMutableList()
+                    }
+                    if (activePath.isNotEmpty()) {
+                        val nextStep = activePath.first()
+                        val distToStep = pos.distanceTo(nextStep)
+                        if (distToStep < 0.15f) {
+                            activePath.removeAt(0)
+                        } else {
+                            val angle = atan2(nextStep.y - pos.y, nextStep.x - pos.x)
+                            heading = angle
+                            lookAngle = 0f
+                            // Mom chases significantly faster!
+                            val chaseSpeed = mom.speed * 1.55f
+                            val stepDist = chaseSpeed * delta
+                            pos = Point2D(
+                                pos.x + cos(angle) * stepDist,
+                                pos.y + sin(angle) * stepDist
+                            )
+                        }
+                    }
+                } else {
+                    // Reached the last known position but player is not visible here
+                    searchT -= delta
+                    if (searchT > 0f) {
+                        // Sweep search look in panic
+                        lookAngle = sin(_timeSeconds.value * 7f) * 0.8f
+                        heading = heading + lookAngle * delta * 5f
+                    } else {
+                        // Resets to calm patrol
+                        chasing = false
+                        lastKnown = null
+                        activePath.clear()
+                    }
+                }
+            } else {
+                // NORMAL PATROL CYCLE
+                if (waitTime > 0f) {
+                    waitTime -= delta
+                    lookAngle = sin(_timeSeconds.value * 4f) * 0.5f
+                    heading = atan2(
+                        mom.waypoints[currentIdx].y - pos.y,
+                        mom.waypoints[currentIdx].x - pos.x
+                    ) + lookAngle
+                } else {
+                    if (activePath.isEmpty()) {
+                        activePath = findPathForMom(pos, mom.waypoints[currentIdx], level).toMutableList()
+                    }
+                    if (activePath.isNotEmpty()) {
+                        val dest = activePath.first()
+                        val distToDest = pos.distanceTo(dest)
+                        if (distToDest < 0.15f) {
+                            activePath.removeAt(0)
+                            if (activePath.isEmpty()) {
+                                waitTime = 1.5f
+                                currentIdx = (currentIdx + 1) % mom.waypoints.size
+                            }
+                        } else {
+                            val angle = atan2(dest.y - pos.y, dest.x - pos.x)
+                            heading = angle
+                            lookAngle = 0f
+                            val stepDist = mom.speed * delta
+                            pos = Point2D(
+                                pos.x + cos(angle) * stepDist,
+                                pos.y + sin(angle) * stepDist
+                            )
+                        }
+                    } else {
+                        waitTime = 1.5f
+                        currentIdx = (currentIdx + 1) % mom.waypoints.size
+                    }
+                }
+            }
+
             mom.copy(
                 gridPos = pos,
                 currentWaypointIndex = currentIdx,
                 waitTimerSeconds = waitTime,
                 headingAngle = heading,
                 searchLookAngle = lookAngle,
-                pathNodes = activePath
+                pathNodes = activePath,
+                isChasing = chasing,
+                lastKnownPlayerPos = lastKnown,
+                chaseSearchTimer = searchT
             )
         }
+        
         _momsState.value = updatedMoms
+        _isChasing.value = anyMomChasing
 
-        // 5. Check if Player got caught in vision cones!
-        var gotCaught = false
-        for (mom in updatedMoms) {
-            val pPos = resolvedPos
-            val mPos = mom.gridPos
-            val dist = mPos.distanceTo(pPos)
-
-            // Player is invisible to Mom if crouched under or behind high obstacles (hiding)
-            val isPlayerHiding = isPlayerPhysicallyHidden(pPos, level, player.isCrouched)
-
-            if (dist <= mom.visionRange && !isPlayerHiding) {
-                // Angle between mom and player
-                val angleToP = atan2(pPos.y - mPos.y, pPos.x - mPos.x)
-                var angleDiff = angleToP - mom.headingAngle
-
-                // Normalize difference to [-PI, PI]
-                while (angleDiff < -PI) angleDiff += (2 * PI).toFloat()
-                while (angleDiff > PI) angleDiff -= (2 * PI).toFloat()
-
-                val viewHalfAngle = (mom.visionAngleDegree * PI / 180f) / 2f
-                if (abs(angleDiff) <= viewHalfAngle) {
-                    // Inside cone! But is there a wall blocking Mom's view?
-                    val pathIsBlocked = isRayBlockedByWalls(mPos, pPos, level)
-                    if (!pathIsBlocked) {
-                        gotCaught = true
-                        break
-                    }
+        // 5. Check if Player got caught!
+        var caughtByMom = false
+        if (!updatedPlayer.isHiding) {
+            for (mom in updatedMoms) {
+                val dist = mom.gridPos.distanceTo(updatedPlayer.gridPos)
+                if (dist < 0.38f) {
+                    caughtByMom = true
+                    break
                 }
             }
         }
 
-        if (gotCaught) {
+        if (caughtByMom) {
             stopGameLoop()
             audioEngine.playSfx(GameAudioEngine.SfxType.CAUGHT)
             withContext(Dispatchers.Main) {

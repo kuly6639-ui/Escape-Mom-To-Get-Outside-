@@ -29,6 +29,7 @@ class GameAudioEngine {
                     SfxType.KEY_PICKUP -> generateChime(listOf(660f, 880f, 1320f), 0.25f)
                     SfxType.UNLOCK -> generateNoiseClick(0.1f)
                     SfxType.CAUGHT -> generateSiren(600f, 150f, 0.5f)
+                    SfxType.TRIGGER_ALERT -> generateSweep(440f, 880f, 0.28f)
                     SfxType.LEVEL_WIN -> generateChime(listOf(523.25f, 659.25f, 783.99f, 1046.50f), 0.4f)
                 }
                 playBuffer(samples, sfxVolume)
@@ -199,6 +200,7 @@ class GameAudioEngine {
         KEY_PICKUP,
         UNLOCK,
         CAUGHT,
+        TRIGGER_ALERT,
         LEVEL_WIN
     }
 }

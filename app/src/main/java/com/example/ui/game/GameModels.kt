@@ -51,7 +51,9 @@ data class PlayerState(
     var isJumping: Boolean = false,
     var jumpProgress: Float = 0f, // 0 to 1.0 parabolic
     val radius: Float = 0.35f,
-    var keysCollected: Int = 0
+    var keysCollected: Int = 0,
+    var isHiding: Boolean = false,
+    var hidingInId: String? = null
 ) {
     val zOffset: Float
         get() = if (isJumping) {
@@ -75,7 +77,10 @@ data class MomState(
     var waitTimerSeconds: Float = 0f,
     var isInvestigating: Boolean = false,
     var searchLookAngle: Float = 0f,
-    var pathNodes: List<Point2D> = emptyList()
+    var pathNodes: List<Point2D> = emptyList(),
+    var isChasing: Boolean = false,
+    var lastKnownPlayerPos: Point2D? = null,
+    var chaseSearchTimer: Float = 0f
 )
 
 data class LevelData(
